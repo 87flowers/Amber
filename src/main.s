@@ -43,7 +43,9 @@ or ecx, -1
 mov rdi, rsi
 repne scasb ; scan for null terminator
 sub edi, esi
+push rbx
 call handle_uci
+pop rbx
 dec rbx
 jnz .argv_loop
 jmp quit
@@ -64,15 +66,17 @@ lea ebx, [g_iInputBufferLen]
 lea esi, [ebx + (g_szInputBuffer - g_iInputBufferLen)]
 mov ecx, dword [rbx]
 mov eax, `\n`
-mov edi, esi
 cmp eax, 0
+mov edi, esi
 repne scasb ; scan for newline
 jne .read_stdin
 mov byte [rdi - 1], 0
 mov dword [rbx + (g_iInputBufferPtr - g_iInputBufferLen)], edi
 sub edi, esi
 sub dword [rbx], edi
+push rbx
 call handle_uci
+pop rbx
 mov esi, dword [rbx + (g_iInputBufferPtr - g_iInputBufferLen)]
 mov edi, dword [rbx + (g_szInputBuffer - g_iInputBufferLen)]
 mov ecx, dword [rbx]
@@ -84,18 +88,70 @@ quit:
 mov eax, 60
 syscall
 
+; param:
+; rdi: current position in string
+; ecx: remaining string length
+; output:
+; rdi: position of next token in stront
+; ecx: remaining string length
+; scratch: eax, flags
+next_token:
+mov eax, ` `
+repne scasb
+mov byte [rdi - 1], 0
+ret
+
 ; params:
 ; rsi: pointer to start of command string
 ; edi: length of command string
 handle_uci:
+mov ecx, edi
+push rcx
+mov rdi, rsi
+call next_token
+movups xmm1, oword [rsi]
+lea eax, [c_uciCmdTable]
+xor ebx, ebx
+.loop:
+cmp ebx, c_uciCmdTable.end - c_uciCmdTable
+jge .end
+movzx esi, byte [eax + ebx]
+mov edx, dword [eax + ebx + 1]
+add ebx, 5
+vpcmpistrm xmm1, oword [eax + esi], 011000b
+jc .loop
+pop rcx
+jmp rdx
+.end:
+ret
+
+cmd_uci:
+cmd_perft:
 mov eax, 1
-mov edx, edi
 mov edi, eax
+lea esi, [g_szInputBuffer]
+mov edx, ecx
 syscall
 ret
 
 section .data align=1
-db 0
+
+%define uciStringTableOffset(x) (c_uciStringTable. %+ x - c_uciCmdTable)
+
+c_uciCmdTable:
+db uciStringTableOffset(uci)
+dd cmd_uci
+db uciStringTableOffset(perft)
+dd cmd_perft
+db uciStringTableOffset(quit)
+dd quit
+.end:
+
+c_uciStringTable:
+.uci:    db "uci", 0
+.perft:  db "perft", 0
+.quit:   db "quit", 0
+.end:
 
 section .bss
 g_iInputBufferLen: resb 4
