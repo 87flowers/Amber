@@ -1,3 +1,5 @@
+%define FULL 1
+
 %define INPUT_BUFFER_SIZE 4096
 %define MAX_GAME_PLY 1024
 
@@ -10,10 +12,12 @@
 %define KING   01000000b
 %define CLRBIT 10000000b
 
-%define SS_aBoard   0
-%define SS_qHash    64
-%define SS_qCastle  72
-%define SS_bStm     80
+%define SS_aBoard         0
+%define SS_qHash         64
+%define SS_qCastle       72
+%define SS_qEnpassant    80
+%define SS_w50mr         88
+%define SS_bStm          90
 
 ; register notes:
 ; rax, rcx and r11 are clobbered by syscall
@@ -116,6 +120,22 @@ repne scasb
 mov byte [rdi - 1], 0
 ret
 
+; param:
+; rsi: current position in string
+; output:
+; ebx: integer value
+; scratch: eax, flags
+parse_int:
+xor eax, eax
+xor ebx, ebx
+.loop:
+imul ebx, ebx, 10
+add ebx, eax
+lodsb
+sub al, 0x30
+jge .loop
+ret
+
 ; params:
 ; rsi: pointer to start of command string
 ; edi: length of command string
@@ -152,11 +172,15 @@ lea rbp, [g_rootPosition]
 vpxord zmm0, zmm0, zmm0
 vmovups zword [rbp + 64], zmm0
 
+%if FULL
 cmp byte [rsi], `f`
 je .fen
+%endif
 
 vmovups zmm0, zword [c_startPos]
 vmovups zword [rbp], zmm0
+
+%if FULL
 
 jmp .fen_done
 .fen:
@@ -176,7 +200,7 @@ cmp al, 0x40
 jg .board_loop_piece
 
 sub al, 0x30
-mov rbx, -8
+mov rbx, -16
 cmovl rax, rbx   ; '/'
 add rbp, rax     ; '1'-'8'
 jmp .board_loop_end
@@ -205,19 +229,26 @@ pop rbp
 
 ; Side to move
 
+mov rsi, rdi
+call next_token
 ;        v
 ; 01100010 b
 ; 01110111 w
-mov al, byte [rdi]
+mov al, byte [rsi]
 xor al, 1
 and al, 1
 mov byte [rbp + SS_bStm], al
-scasb
-scasb
 
 ; Castling rights
 
+lea rdx, [rbp + SS_qCastle]
+bts qword [rdx], 0x04
+bts qword [rdx], 0x3C
+
 mov rsi, rdi
+call next_token
+push rcx
+
 .castling_loop:
 xor eax, eax
 lodsb
@@ -237,18 +268,77 @@ shl ecx, 3
 mov eax, 0x3F380700
 shr eax, cl
 movzx eax, al
-bts qword [rbp + SS_qCastle], rax
+bts qword [rdx], rax
 
 jmp .castling_loop
 .castling_loop_end:
 
-;
+not qword [rdx]
+pop rcx
+
+; Enpassant square
+
+mov rsi, rdi
+call next_token
+
+mov ax, word [rsi]
+cmp al, `-`
+je .skip_enpassant
+
+sub ax, 0x0101
+mov ebx, 0x0707
+pext eax, eax, ebx
+bts qword [rbp + SS_qEnpassant], rax
+
+.skip_enpassant:
+
+; 50mr clock
+
+mov rsi, rdi
+call next_token
+call parse_int
+mov word [rbp + SS_w50mr], bx
+
+; full move clock　(ignore it)
+
+call next_token
 
 .fen_done:
 
-lea rax, [g_rootPosition]
+%endif
+
+; `moves` token (ignore it)
+; (the first next_token call ignores the moves token)
+jmp .start_move_parse_loop
+
+; parse moves
+
+.move_parse_loop:
+
+; 01010001 = 0x51
+;  v v   v
+; 00100000   | 000
+; 01110001 q | 111
+; 01110010 r | 110
+; 01100011 b | 101
+; 01101110 n | 100
+mov rbx, 0x5107070707
+mov rax, qword [rsi]
+sub rax, 0x01010101
+pext rax, rax, rbx
+
+push rcx
+call make_move
+pop rcx
+
+.start_move_parse_loop:
+mov rsi, rdi
+call next_token
+cmp esi, edi
+jne .move_parse_loop
 
 ret
+
 
 cmd_perft:
 cmd_uci:
@@ -267,10 +357,66 @@ mov edi, eax
 syscall
 ret
 
-section .data align=1
+; params:
+; eax: move
+; rbp: pointer to current position (in stack)
+; output:
+; rbp: pointer to new position (in stack)
+; scratch: rbx, rdx, 
+make_move:
 
-c_pieceParseTable:
-db "P.NBRQK..pnbrqk."
+vmovaps zmm0, zword [rbp]
+vmovaps zmm0, zword [rbp + 64]
+add rbp, 128
+vmovaps zword [rbp], zmm0
+vmovaps zword [rbp + 64], zmm0
+
+; ebx: source square
+; edx: destination square
+; cl: destination piece type
+mov ebx, eax
+mov edx, eax
+shr edx, 6
+and ebx, 0x3F
+and edx, 0x3F
+
+mov cl, byte [rbp + rbx]
+btc eax, 14
+jnc .not_promo
+mov eax, ecx
+shl eax, 12
+mov cl, byte [c_promoOrder + rax]
+.not_promo:
+
+test cl, WPAWN | BPAWN
+jz .not_pawn
+
+test al, 0x41
+jp .not_double_push
+
+; Pawn Double Push
+
+.not_double_push:
+bt qword [rbp + SS_qEnpassant], rdx
+jnc .normal_ptype
+
+; En passant
+
+jmp .normal_ptype
+
+.not_pawn:
+test cl, KING
+jz .normal_ptype
+test al, 0x41
+jp .normal_ptype
+
+; Castling
+
+.normal_ptype:
+
+ret
+
+section .data align=1
 
 %define uciStringTableOffset(x) (c_uciStringTable. %+ x - c_uciCmdTable)
 
@@ -286,6 +432,9 @@ db "P.NBRQK..pnbrqk."
 %define BQ 10100000b
 %define WK 01000000b
 %define BK 11000000b
+
+c_promoOrder:
+db WN, WB, WR, WQ
 
 c_startPos:
 db WR, WN, WB, WQ, WK, WB, WN, WR
@@ -317,6 +466,11 @@ c_uciStringTable:
 .perft:       db "perft", 0
 .quit:        db "quit", 0
 .end:
+
+%if FULL
+c_pieceParseTable:
+db "P NBRQK  pnbrqk "
+%endif
 
 section .bss
 g_iInputBufferLen: resb 4
