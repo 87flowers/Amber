@@ -17,7 +17,8 @@
 %define SS_qCastle       72
 %define SS_qEnpassant    80
 %define SS_w50mr         88
-%define SS_bStm          90
+%define SS_wFromNull     90
+%define SS_bStm          92 ; 0x00 = white, 0x80 = black
 
 ; register notes:
 ; rax, rcx and r11 are clobbered by syscall
@@ -47,6 +48,8 @@ global _start
 
 _start:
 
+%if FULL
+
 ; Check argc
 pop rbx
 pop rax
@@ -67,6 +70,8 @@ pop rbx
 dec rbx
 jnz .argv_loop
 jmp quit
+
+%endif
 
 ; Parse stdin
 .read_stdin:
@@ -235,8 +240,8 @@ call next_token
 ; 01100010 b
 ; 01110111 w
 mov al, byte [rsi]
-xor al, 1
-and al, 1
+not al
+shl al, 7
 mov byte [rbp + SS_bStm], al
 
 ; Castling rights
@@ -264,6 +269,7 @@ jl .castling_loop_end
 ; 01101011  k | 63 = 0x3F
 mov ecx, 00100010b
 pext ecx, eax, ecx
+; TODO: Switch to lookup table, should be smaller codesize
 shl ecx, 3
 mov eax, 0x3F380700
 shr eax, cl
@@ -308,11 +314,11 @@ call next_token
 %endif
 
 ; `moves` token (ignore it)
-; (the first next_token call ignores the moves token)
-jmp .start_move_parse_loop
+call next_token
 
 ; parse moves
 
+jmp .start_move_parse_loop
 .move_parse_loop:
 
 ; 01010001 = 0x51
@@ -338,7 +344,6 @@ cmp esi, edi
 jne .move_parse_loop
 
 ret
-
 
 cmd_perft:
 cmd_uci:
@@ -366,27 +371,49 @@ ret
 make_move:
 
 vmovaps zmm0, zword [rbp]
-vmovaps zmm0, zword [rbp + 64]
+vmovaps zmm1, zword [rbp + 64]
 add rbp, 128
 vmovaps zword [rbp], zmm0
-vmovaps zword [rbp + 64], zmm0
+vmovaps zword [rbp + 64], zmm1
 
 ; ebx: source square
 ; edx: destination square
-; cl: destination piece type
 mov ebx, eax
 mov edx, eax
 shr edx, 6
 and ebx, 0x3F
 and edx, 0x3F
 
+; cl: destination piece type
 mov cl, byte [rbp + rbx]
 btc eax, 14
 jnc .not_promo
-mov eax, ecx
-shl eax, 12
+; we destroy eax here, but we don't need eax because cl is never a KING or PAWN
+shr eax, 12
 mov cl, byte [c_promoOrder + rax]
+or cl, byte [rbp + SS_bStm]
 .not_promo:
+
+inc word [rbp + SS_w50mr]
+inc word [rbp + SS_wFromNull]
+
+cmp byte [rbp + rdx], 0
+je .not_capture
+; Capture: Reset half-move counters
+; ASSUMES: SS_w50mr and SS_wFromNull are contiguous in memory
+mov dword [rbp + SS_w50mr], 0
+.not_capture:
+
+; erase source square
+mov byte [rbp + rbx], 0
+; set destination square
+mov byte [rbp + rdx], cl
+; set source and dest as touched
+bts qword [rbp + SS_qCastle], rbx
+bts qword [rbp + SS_qCastle], rdx
+; register rbx and rdx are free to use now
+
+; Handle special moves
 
 test cl, WPAWN | BPAWN
 jz .not_pawn
@@ -396,11 +423,30 @@ jp .not_double_push
 
 ; Pawn Double Push
 
+; Reset half-move counters
+; ASSUMES: SS_w50mr and SS_wFromNull are contiguous in memory
+mov dword [rbp + SS_w50mr], 0
+; Calculate new enpassant square and set it
+add ebx, edx
+shr ebx, 1
+xor eax, eax
+bts rax, rbx
+mov qword [rbp + SS_qEnpassant], rax
+
+jmp .normal_ptype_no_clear_enpassant
+
 .not_double_push:
 bt qword [rbp + SS_qEnpassant], rdx
 jnc .normal_ptype
 
 ; En passant
+
+; Clear victim square
+mov eax, 0x07
+and eax, edx
+and ebx, 0x38
+or eax, ebx
+mov byte [rbp + rax], 0
 
 jmp .normal_ptype
 
@@ -412,7 +458,54 @@ jp .normal_ptype
 
 ; Castling
 
+; Two possible moves:
+; e->c (2 = 010b)
+; e->g (6 = 110b)
+; note that bit 2 of the destination file is the differentiator here 
+
+mov al, ROOK
+or al, byte [rbp + SS_bStm]
+
+bt edx, 2
+jc .king_side
+
+; Queen-side castling
+; rook: a->c (0->3), king src is on 4
+
+mov byte [rbp + rbx - 4], 0
+mov byte [rbp + rbx - 1], al
+jmp .normal_ptype
+
+.king_side:
+
+; King-side castling
+; rook: h->f (7->5), king src is on 4
+
+mov byte [rbp + rbx + 3], 0
+mov byte [rbp + rbx + 1], al
+; [[fallthrough]]
+
 .normal_ptype:
+mov qword [rbp + SS_qEnpassant], 0
+.normal_ptype_no_clear_enpassant:
+
+; Calculate hash
+vmovaps zmm0, zword [rbp]
+vpbroadcastb zmm1, byte [rbp + SS_bStm]
+vpxord zmm0, zmm0, zmm1
+vaesenc zmm0, zmm0, zmm0
+valignq zmm1, zmm0, zmm0, 4
+vaesenc zmm0, zmm0, zmm1
+valignq zmm1, zmm0, zmm0, 2
+vaesenc zmm0, zmm0, zmm1
+valignq zmm1, zmm0, zmm0, 1
+vaesenc zmm0, zmm0, zmm1
+vaesenc zmm0, zmm0, zmm0
+vpmovb2m k0, zmm0
+kmovq qword [rbp + SS_qHash], k0
+
+; Invert side-to-move
+xor byte [rbp + SS_bStm], 0x80
 
 ret
 
@@ -477,4 +570,5 @@ g_iInputBufferLen: resb 4
 g_iInputBufferPtr: resb 4
 g_szInputBuffer: resb INPUT_BUFFER_SIZE
 
+alignb 128
 g_rootPosition: resb 128 * MAX_GAME_PLY
