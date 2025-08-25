@@ -12,13 +12,17 @@
 %define KING   01000000b
 %define CLRBIT 10000000b
 
-%define SS_aBoard         0
+%define SS_aBoard        0
 %define SS_qHash         64
 %define SS_qCastle       72
 %define SS_qEnpassant    80
 %define SS_w50mr         88
 %define SS_wFromNull     90
 %define SS_bStm          92 ; 0x00 = white, 0x80 = black
+%define SS_bNoisyCount   93
+%define SS_bQuietCount   94
+%define SS_aMoveList     128
+%define SS_size          128 + 512
 
 ; register notes:
 ; rax, rcx and r11 are clobbered by syscall
@@ -30,10 +34,10 @@
 ; rdx: param
 ; rbx: -
 ; rsp: stack
-; rbp: -
+; rbp: -             SS pointer
 ; rsi: param
 ; rdi: param
-; r8 : param
+; r8 : param         MP pointer
 ; r9 : param
 ; r10: param
 ; r11: scratch
@@ -211,9 +215,9 @@ add rbp, rax     ; '1'-'8'
 jmp .board_loop_end
 
 .board_loop_piece:
-movd xmm0, eax
-pcmpistrm xmm0, oword [c_pieceParseTable], 0
-movd eax, xmm0
+vmovd xmm0, eax
+vpcmpistrm xmm0, oword [c_pieceParseTable], 0
+vmovd eax, xmm0
 
 cmp ah, 0
 je .board_loop_white_piece
@@ -367,12 +371,12 @@ ret
 ; rbp: pointer to current position (in stack)
 ; output:
 ; rbp: pointer to new position (in stack)
-; scratch: rbx, rdx, 
+; scratch: rax, rbx, rdx, rcx, zmm0, zmm1, k0
 make_move:
 
 vmovaps zmm0, zword [rbp]
 vmovaps zmm1, zword [rbp + 64]
-add rbp, 128
+add rbp, SS_size
 vmovaps zword [rbp], zmm0
 vmovaps zword [rbp + 64], zmm1
 
@@ -509,12 +513,66 @@ xor byte [rbp + SS_bStm], 0x80
 
 ret
 
-section .data align=1
+; (in/out) rbp: pointer to current position
+; scratch: zmm0, zmm1, rax, rbx, rcx, rdx, rdi, rsi
+movegen:
+
+int3
+
+movzx eax, byte [rbp + SS_bStm]                                            ; rax  = stm
+vmovaps zmm0, zword [rbp]                                                  ; zmm0 = board
+vptestnmb k1, zmm0, zmm0                                                   ; k1   = empty bitboard
+vpbroadcastb zmm1, eax
+vpxord zmm1, zmm1, zmm0                                                    ; zmm1 = stm board (msb = 0 is stm, msb = 1 is nstm)
+vpmovb2m k2, zmm1
+kandnq k2, k1, k2                                                          ; k2   = enemy bitboard
+shr eax, 1
+
+; Quiet moves
+
+kmovq rbx, k1                                                              ; rbx  = remaining bitboard
+
+.loop_quiet:
+tzcnt rdx, rbx                                                             ; rdx  = current square
+jc .done_quiet
+
+mov edi, 1110111b
+pdep ecx, edx, edi
+vpbroadcastb zmm2, ecx                                                     ;        expanded square
+vpbroadcastb zmm3, edi                                                     ;        0x77
+vpaddb zmm2, zmm2, zword [c_bitrayPermOffsets]                             ;        expanded ray coords
+vpandnd zmm3, zmm3, zmm2                                                   ;        0x88 & coords
+vptestnmb k2, zmm3, zmm3                                                   ; k2   = zero in zmm3 (valid coords)
+vgf2p8affineqb zmm2, zmm2, qword [c_compressCoordsMatrix]{1to8}, 0         ; zmm2 = ray coords
+vpermb zmm3, zmm2, zmm1                                                    ; zmm3 = ray places (stm)
+vpermb zmm4, zmm2, zmm0                                                    ; zmm4 = ray places (normal)
+vpmovb2m k3, zmm3                                                          ; k3   = nstm bitrays
+vptestmb k4, zmm4, zmm4
+kandq k4, k4, k2                                                           ; k4   = occupied bitrays
+
+kmovq k5, [c_x81]
+kmovq k6, [c_x03]
+
+korq k5, k5, k4
+kandnq k4, k3, k4                                                          ; k4   = friendly bitrays
+knotq k5, k5
+kaddq k5, k5, k6
+kandq k5, k5, k4                                                           ; k5   = bitrays closest (stm)
+
+vptestmb k6, zmm4, zword [c_bitrayQuietAttacks]                            ;        bitrays attackers
+kandq k6, k5, k6                                                           ; k6   = bitrays attackers (stm)
+
+blsr rbx, rbx
+jmp .loop_quiet
+.done_quiet:
+
+;; Data Section
 
 %define uciStringTableOffset(x) (c_uciStringTable. %+ x - c_uciCmdTable)
 
+;          ckqrbnpp
 %define WP 00000001b
-%define BP 00000010b
+%define BP 10000010b
 %define WN 00000100b
 %define BN 10000100b
 %define WB 00001000b
@@ -525,6 +583,55 @@ section .data align=1
 %define BQ 10100000b
 %define WK 01000000b
 %define BK 11000000b
+
+;                   ckqrbnpp
+%define HORSE       00000100b   ; Knight
+%define ORTH        00110000b   ; rook and queen
+%define DIAG        00101000b   ; bishop and queen
+%define ORTH_NEAR   01110000b   ; king, rook and queen
+%define DIAG_NEAR   01101000b   ; king, bishop and queen
+%define WPOR_NEAR   01110001b   ; wp, king, rook and queen
+%define BPOR_NEAR   01110010b   ; bp, king, rook and queen
+%define WPDG_NEAR   01101001b   ; wp, king, bishop and queen
+%define BPDG_NEAR   01101010b   ; bp, king, bishop and queen
+
+c_bitrayPermOffsets:
+db 0x1F, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70  ; N
+db 0x21, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77  ; NE
+db 0x12, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07  ; E
+db 0xF2, 0xF1, 0xE2, 0xD3, 0xC4, 0xB5, 0xA6, 0x97  ; SE
+db 0xE1, 0xF0, 0xE0, 0xD0, 0xC0, 0xB0, 0xA0, 0x90  ; S
+db 0xDF, 0xEF, 0xDE, 0xCD, 0xBC, 0xAB, 0x9A, 0x89  ; SW
+db 0xEE, 0xFF, 0xFE, 0xFD, 0xFC, 0xFB, 0xFA, 0xF9  ; W
+db 0x0E, 0x0F, 0x1E, 0x2D, 0x3C, 0x4B, 0x5A, 0x69  ; NW
+
+c_bitrayQuietAttacks:
+db HORSE, BPOR_NEAR, ORTH, ORTH, ORTH, ORTH, ORTH, ORTH  ; N
+db HORSE, DIAG_NEAR, DIAG, DIAG, DIAG, DIAG, DIAG, DIAG  ; NE
+db HORSE, ORTH_NEAR, ORTH, ORTH, ORTH, ORTH, ORTH, ORTH  ; E
+db HORSE, DIAG_NEAR, DIAG, DIAG, DIAG, DIAG, DIAG, DIAG  ; SE
+db HORSE, WPOR_NEAR, ORTH, ORTH, ORTH, ORTH, ORTH, ORTH  ; S
+db HORSE, DIAG_NEAR, DIAG, DIAG, DIAG, DIAG, DIAG, DIAG  ; SW
+db HORSE, ORTH_NEAR, ORTH, ORTH, ORTH, ORTH, ORTH, ORTH  ; W
+db HORSE, DIAG_NEAR, DIAG, DIAG, DIAG, DIAG, DIAG, DIAG  ; NW
+
+c_bitrayNoisyAttacks:
+db HORSE, ORTH_NEAR, ORTH, ORTH, ORTH, ORTH, ORTH, ORTH  ; N
+db HORSE, BPDG_NEAR, DIAG, DIAG, DIAG, DIAG, DIAG, DIAG  ; NE
+db HORSE, ORTH_NEAR, ORTH, ORTH, ORTH, ORTH, ORTH, ORTH  ; E
+db HORSE, WPDG_NEAR, DIAG, DIAG, DIAG, DIAG, DIAG, DIAG  ; SE
+db HORSE, ORTH_NEAR, ORTH, ORTH, ORTH, ORTH, ORTH, ORTH  ; S
+db HORSE, WPDG_NEAR, DIAG, DIAG, DIAG, DIAG, DIAG, DIAG  ; SW
+db HORSE, ORTH_NEAR, ORTH, ORTH, ORTH, ORTH, ORTH, ORTH  ; W
+db HORSE, BPDG_NEAR, DIAG, DIAG, DIAG, DIAG, DIAG, DIAG  ; NW
+
+c_compressCoordsMatrix:
+dq 0x0102041020400000
+
+c_x81:
+dq 0x8181818181818181
+c_x03:
+dq 0x0303030303030303
 
 c_promoOrder:
 db WN, WB, WR, WQ
@@ -547,7 +654,7 @@ dd cmd_echo
 db uciStringTableOffset(uci)
 dd cmd_uci
 db uciStringTableOffset(perft)
-dd cmd_perft
+dd movegen
 db uciStringTableOffset(quit)
 dd quit
 .end:
@@ -570,5 +677,5 @@ g_iInputBufferLen: resb 4
 g_iInputBufferPtr: resb 4
 g_szInputBuffer: resb INPUT_BUFFER_SIZE
 
-alignb 128
-g_rootPosition: resb 128 * MAX_GAME_PLY
+alignb 64
+g_rootPosition: resb SS_size * MAX_GAME_PLY
